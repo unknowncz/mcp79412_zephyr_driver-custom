@@ -1,0 +1,8 @@
+menuconfig MCP79412
+	bool "MCP79412 RTC IC"
+	default y
+	depends on DT_HAS_MICROCHIP_MCP79412_ENABLED
+
+if MCP79412
+
+endif
