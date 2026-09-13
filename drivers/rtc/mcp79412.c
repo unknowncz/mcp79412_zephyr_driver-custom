@@ -17,7 +17,7 @@
 #include <zephyr/drivers/counter.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/i2c.h>
-#include <rtc_mcp79412.h>
+#include "mcp79412.h"
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/timeutil.h>
