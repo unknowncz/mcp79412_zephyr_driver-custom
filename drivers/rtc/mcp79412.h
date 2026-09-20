@@ -49,8 +49,6 @@
 #define MCP79412_REG_PWRUPDATE 0x1E
 #define MCP79412_REG_PWRUPMNTH 0x1F
 
-#define RTC_PTR DEVICE_DT_GET_ONE(microchip_mcp79412);
-
 enum mcp79412_alarm_trigger {
 	MCP79412_ALARM_TRIGGER_SECONDS	= 0x0,
 	MCP79412_ALARM_TRIGGER_MINUTES	= 0x1,
@@ -100,10 +98,6 @@ enum mcp79412_register {
 };
 
 #define RTC_BCD_DECODE(reg_prefix) (reg_prefix##_one + reg_prefix##_ten * 10)
-
-typedef void (*counter_alarm_callback_t)(const struct device *dev,
-					 uint8_t chan_id, uint32_t ticks,
-					 void *user_data);
 
 struct mcp79412_rtc_sec {
 	uint8_t sec_one : 4;
@@ -262,15 +256,13 @@ struct mcp79412_data {
 	struct k_work alarm_work;
 	struct gpio_callback int_callback;
 
-	counter_alarm_callback_t counter_handler[2];
-	uint32_t counter_ticks[2];
+	rtc_alarm_callback rtc_handler[2];
+	struct rtc_time callback_time[2]; // TODO: Change name
 	void *alarm_user_data[2];
 
 	bool int_active_high;
 };
 
-int mcp79412_rtc_set_time(const struct device *dev, time_t unix_time);
-
-int read_time(const struct device *dev, time_t *unix_time);
+int mcp79412_rtc_set_time(const struct device *dev, const struct rtc_time *time);
 
 #endif

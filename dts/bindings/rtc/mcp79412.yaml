@@ -1,11 +1,12 @@
 compatible: "microchip,mcp79412"
 
-include: [base.yaml, i2c-device.yaml]
+include: [base.yaml, i2c-device.yaml, rtc-device.yaml]
 
 description: |
   mcp79412 RTC calendar
 
 properties:
+
   vbat-enable:
     type: boolean
     required: false
