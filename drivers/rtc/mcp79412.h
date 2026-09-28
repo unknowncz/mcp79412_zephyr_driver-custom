@@ -257,12 +257,15 @@ struct mcp79412_data {
 	struct gpio_callback int_callback;
 
 	rtc_alarm_callback rtc_handler[2];
-	struct rtc_time callback_time[2]; // TODO: Change name
+	struct rtc_time callback_time[2];
+	uint16_t alarm_mask[2];
 	void *alarm_user_data[2];
+
+	bool update_callback_mode;
+	rtc_update_callback update_callback;
+	void *update_user_data;
 
 	bool int_active_high;
 };
-
-int mcp79412_rtc_set_time(const struct device *dev, const struct rtc_time *time);
 
 #endif

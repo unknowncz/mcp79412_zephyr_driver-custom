@@ -49,7 +49,6 @@ LOG_MODULE_REGISTER(MCP79412, CONFIG_RTC_LOG_LEVEL);
 #define RTC_BCD_DECODE(reg_prefix) (reg_prefix##_one + reg_prefix##_ten * 10)
 
 struct mcp79412_config {
-	struct counter_config_info generic; //TODO: change
 	struct i2c_dt_spec i2c;
 	const struct gpio_dt_spec int_gpios;
 	bool vbat_enable;
@@ -71,7 +70,8 @@ static struct rtc_time decode_rtc(const struct device *dev)
 	time.tm_min = RTC_BCD_DECODE(data->registers.rtc_min.min);
 	time.tm_hour = RTC_BCD_DECODE(data->registers.rtc_hours.hr);
 	time.tm_mday = RTC_BCD_DECODE(data->registers.rtc_date.date);
-	time.tm_wday = data->registers.rtc_weekday.weekday;
+	// tm struct uses 0-6 from sunday as opposed to 1-7 BCD in IC
+	time.tm_wday = data->registers.rtc_weekday.weekday - 1;
 	// tm struct starts months at 0, mcp79412 starts at 1 
 	time.tm_mon = RTC_BCD_DECODE(data->registers.rtc_month.month) - 1;
 	// tm struct uses years since 1900 but unix time uses years since 1970 
@@ -128,6 +128,7 @@ static int encode_rtc(const struct device *dev, const struct rtc_time * const ti
 	return 0;
 }
 
+#if defined(CONFIG_RTC_ALARM)
 /** @brief Encode time struct tm into mcp79412 alarm registers
  *
  * @param dev the MCP79412 device pointer.
@@ -138,7 +139,7 @@ static int encode_rtc(const struct device *dev, const struct rtc_time * const ti
  * @retval return 0 on success, or a negative error code from invalid
  * parameter.
  */
-static int encode_alarm(const struct device *dev, const struct rtc_time *time_buffer, uint8_t alarm_id)
+static int encode_alarm(const struct device *dev, const struct rtc_time * const time_buffer, uint8_t alarm_id)
 {
 	struct mcp79412_data *data = dev->data;
 	uint8_t month;
@@ -168,6 +169,32 @@ static int encode_alarm(const struct device *dev, const struct rtc_time *time_bu
 
 	return 0;
 }
+
+static int decode_alarm(const struct device *dev, struct rtc_time * const time_buffer, uint8_t alarm_id)
+{
+	struct mcp79412_data *data = dev->data;
+	struct mcp79412_alarm_registers *alm_regs;
+
+	if (alarm_id == ALARM0_ID) {
+		alm_regs = &data->alm0_registers;
+	} else if (alarm_id == ALARM1_ID) {
+		alm_regs = &data->alm1_registers;
+	} else {
+		return -EINVAL;
+	}
+
+	/* In a tm struct, months and weekdays start at 0 */
+
+	time_buffer->tm_sec 	= RTC_BCD_DECODE(alm_regs->alm_sec.sec);
+	time_buffer->tm_min 	= RTC_BCD_DECODE(alm_regs->alm_min.min);
+	time_buffer->tm_hour 	= RTC_BCD_DECODE(alm_regs->alm_hours.hr);
+	time_buffer->tm_wday	= alm_regs->alm_weekday.weekday - 1;
+	time_buffer->tm_mday 	= RTC_BCD_DECODE(alm_regs->alm_date.date);
+	time_buffer->tm_mon		= RTC_BCD_DECODE(alm_regs->alm_month.month) - 1;
+
+	return 0;
+}
+#endif /* CONFIG_RTC_ALARM */
 
 /** @brief Reads single register from MCP79412
  *
@@ -293,8 +320,8 @@ static int set_day_of_week(const struct device *dev, struct tm *time)
 {
 	struct mcp79412_data *data = dev->data;
 	int rc = 0;
-
-	data->registers.rtc_weekday.weekday = time->tm_wday;
+	// tm struct uses 0-6 from sunday as opposed to 1-7 BCD in IC
+	data->registers.rtc_weekday.weekday = time->tm_wday + 1; 
 	rc = write_register(dev, REG_RTC_WDAY,
 		*((uint8_t *)(&data->registers.rtc_weekday)));
 
@@ -308,14 +335,11 @@ static int set_day_of_week(const struct device *dev, struct tm *time)
  * @param dev the MCP79412 device pointer.
  * @param alarm_id ID of alarm, can be 0 or 1 for MCP79412.
  */
-static void mcp79412_handle_interrupt(const struct device *dev, uint8_t alarm_id)
-{
+static int mcp79412_alarm_is_pending(const struct device *dev, uint16_t alarm_id) {
 	struct mcp79412_data *data = dev->data;
-	uint8_t alarm_reg_address;
 	struct mcp79412_alarm_registers *alm_regs;
-	rtc_alarm_callback cb;
-	struct rtc_time time = {0};
-	bool fire_callback = false;
+	uint8_t alarm_reg_address;
+	int ispending = 0;
 
 	if (alarm_id == ALARM0_ID) {
 		alarm_reg_address = REG_ALM0_WDAY;
@@ -324,20 +348,41 @@ static void mcp79412_handle_interrupt(const struct device *dev, uint8_t alarm_id
 		alarm_reg_address = REG_ALM1_WDAY;
 		alm_regs = &data->alm1_registers;
 	} else {
-		return;
+		return -EINVAL;
 	}
-
+	
 	k_sem_take(&data->lock, K_FOREVER);
 
+	int rc = read_register(dev, alarm_reg_address, (uint8_t *)&alm_regs->alm_weekday);
+	
+	if (rc != 0) goto out;
+	
+	ispending = alm_regs->alm_weekday.alm_if;
+	alm_regs->alm_weekday.alm_if = 0;
+
+	rc = write_register(dev, alarm_reg_address, *(uint8_t *)&alm_regs->alm_weekday);
+
+out:
+	k_sem_give(&data->lock);
+
+	if (rc != 0) return rc;
+	return ispending;
+}
+
+static void mcp79412_handle_interrupt(const struct device *dev, uint16_t alarm_id)
+{
+	struct mcp79412_data *data = dev->data;
+	rtc_alarm_callback cb;
+	struct rtc_time time = {0};
+	bool fire_callback = false;
+
+	if (!(alarm_id == ALARM0_ID || alarm_id == ALARM1_ID)) return;
+
+	bool pending = mcp79412_alarm_is_pending(dev, alarm_id);
+	k_sem_take(&data->lock, K_FOREVER);
+	
 	/* Check if this alarm has a pending interrupt */
-	read_register(dev, alarm_reg_address, (uint8_t *)&alm_regs->alm_weekday);
-
-	if (alm_regs->alm_weekday.alm_if) {
-		/* Clear interrupt */
-		alm_regs->alm_weekday.alm_if = 0;
-		write_register(dev, alarm_reg_address,
-			*((uint8_t *)(&alm_regs->alm_weekday)));
-
+	if (pending) {
 		/* Fire callback */
 		if (data->rtc_handler[alarm_id]) {
 			cb = data->rtc_handler[alarm_id];
@@ -371,7 +416,7 @@ static void mcp79412_init_cb(const struct device *dev,
 
 	ARG_UNUSED(pins);
 
-	k_work_submit(&data->alarm_work);
+	(void)k_work_submit(&data->alarm_work);
 }
 
 int mcp79412_rtc_set_time(const struct device *dev, const struct rtc_time *time)
@@ -401,6 +446,7 @@ int mcp79412_rtc_set_time(const struct device *dev, const struct rtc_time *time)
 	return rc;
 }
 
+#if defined(CONFIG_RTC_ALARM)
 static int mcp79412_alarm_supported(const struct device *dev, uint16_t alarm_id,
 				      uint16_t * mask) {
 	if (!(alarm_id == 0 || alarm_id == 1)) {
@@ -424,8 +470,10 @@ static int mcp79412_alarm_set_time(const struct device *dev, uint16_t alarm_id,
 	struct mcp79412_alarm_registers *alm_regs;
 	int rc = 0;
 
+	if (alarm_time == NULL) return -EINVAL;
+	
 	k_sem_take(&data->lock, K_FOREVER);
-
+	
 	if (alarm_id == ALARM0_ID) {
 		alarm_base_address = REG_ALM0_SEC;
 		alm_regs = &data->alm0_registers;
@@ -441,24 +489,21 @@ static int mcp79412_alarm_set_time(const struct device *dev, uint16_t alarm_id,
 
 	rc = mcp79412_alarm_supported(dev, alarm_id, &mask);
 
-	if (rc != 0) return rc;
+	if (rc != 0) goto out;
 
 	/* Set alarm to match with second, minute, hour, day of week, day of
 	 * month and month
 	 */
 	uint8_t alm_msk = 0;
-	if (mask & RTC_ALARM_TIME_MASK_SECOND) 	 	alm_msk = MCP79412_ALARM_TRIGGER_SECONDS;
-	if (mask & RTC_ALARM_TIME_MASK_MINUTE) 	 	alm_msk = MCP79412_ALARM_TRIGGER_MINUTES;
-	if (mask & RTC_ALARM_TIME_MASK_HOUR) 	 	alm_msk = MCP79412_ALARM_TRIGGER_HOURS;
-	if (mask & RTC_ALARM_TIME_MASK_WEEKDAY)  	alm_msk = MCP79412_ALARM_TRIGGER_WDAY;
-	if (mask & RTC_ALARM_TIME_MASK_MONTHDAY) 	alm_msk = MCP79412_ALARM_TRIGGER_DATE;
-	if (mask & (RTC_ALARM_TIME_MASK_SECOND 	|
-				RTC_ALARM_TIME_MASK_MINUTE 	|
-				RTC_ALARM_TIME_MASK_HOUR 	|
-				RTC_ALARM_TIME_MASK_WEEKDAY |
-				RTC_ALARM_TIME_MASK_MONTHDAY)) 	alm_msk = MCP79412_ALARM_TRIGGER_ALL;
+	//TODO: handle case where multiple fields are selected by storing target time and mask properly
+	//TODO: fix alarms always selecting MCP79412_ALARM_TRIGGER_ALL
+	if (mask != 0) alm_msk = MCP79412_ALARM_TRIGGER_ALL;
+	if ((mask & RTC_ALARM_TIME_MASK_SECOND) && ~(mask & ~RTC_ALARM_TIME_MASK_SECOND)) alm_msk = MCP79412_ALARM_TRIGGER_SECONDS;
+	else if ((mask & RTC_ALARM_TIME_MASK_MINUTE) && ~(mask & ~RTC_ALARM_TIME_MASK_MINUTE)) alm_msk = MCP79412_ALARM_TRIGGER_MINUTES;
+	else if ((mask & RTC_ALARM_TIME_MASK_HOUR) && ~(mask & ~RTC_ALARM_TIME_MASK_HOUR)) alm_msk = MCP79412_ALARM_TRIGGER_HOURS;
+	else if ((mask & RTC_ALARM_TIME_MASK_WEEKDAY) && ~(mask & ~RTC_ALARM_TIME_MASK_WEEKDAY)) alm_msk = MCP79412_ALARM_TRIGGER_WDAY;
+	else if ((mask & RTC_ALARM_TIME_MASK_MONTHDAY) && ~(mask & ~RTC_ALARM_TIME_MASK_MONTHDAY)) alm_msk = MCP79412_ALARM_TRIGGER_DATE;
 
-	// TODO: handle case where multiple fields are selected by storing target time and mask
 	alm_regs->alm_weekday.alm_msk = alm_msk;
 
 	/* Write time to alarm registers */
@@ -477,6 +522,8 @@ static int mcp79412_alarm_set_time(const struct device *dev, uint16_t alarm_id,
 
 	/* Config user data and callback */
 	data->callback_time[alarm_id] = *alarm_time;
+	data->alarm_mask[alarm_id] = mask;
+
 
 out:
 	k_sem_give(&data->lock);
@@ -484,102 +531,80 @@ out:
 	return rc;
 }
 
-static int rtc_alarm_set_callback(const struct device *dev, uint16_t alarm_id, 
+static int mcp79412_alarm_get_time(const struct device *dev, uint16_t alarm_id,
+				      uint16_t *mask, struct rtc_time *alarm_time)
+{
+	struct mcp79412_data *data = dev->data;
+	const struct mcp79412_config *cfg = dev->config;
+	struct mcp79412_alarm_registers *alm_regs;
+	uint8_t addr;
+	if (mask == NULL || alarm_time == NULL) return -EINVAL;
+	if (alarm_id == ALARM0_ID) {
+		alm_regs = &data->alm0_registers;
+		addr = REG_ALM0_SEC;
+	}
+	else if (alarm_id == ALARM1_ID) {
+		alm_regs = &data->alm1_registers;
+		addr = REG_ALM1_SEC;
+	}
+	else return -EINVAL;
+
+	k_sem_take(&data->lock, K_FOREVER);
+
+	int rc = i2c_write_read_dt(&cfg->i2c, &addr, sizeof(addr), alm_regs, RTC_ALARM_REGISTERS_SIZE);
+	
+	if (rc != 0) goto out;
+
+	rc = decode_alarm(dev, alarm_time, alarm_id);
+	*mask = data->alarm_mask[alarm_id];
+
+out:
+	k_sem_give(&data->lock);
+
+	return rc;
+}
+
+static int mcp79412_alarm_set_callback(const struct device *dev, uint16_t alarm_id, 
 	rtc_alarm_callback callback, void *user_data) {
 	struct mcp79412_data *data = dev->data;
+	k_sem_take(&data->lock, K_FOREVER);
 	data->rtc_handler[alarm_id] = callback;
 	data->alarm_user_data[alarm_id] = user_data;
+	k_sem_give(&data->lock);
 	return 0;
 }
+#endif /* CONFIG_RTC_ALARM */
 
-static int mcp79412_counter_cancel_alarm(const struct device *dev, uint8_t alarm_id)
-{
+#if defined(CONFIG_RTC_UPDATE)
+static int mcp79412_update_set_callback(const struct device * dev,
+		rtc_update_callback callback, void * user_data) {
 	struct mcp79412_data *data = dev->data;
-	int rc = 0;
-
 	k_sem_take(&data->lock, K_FOREVER);
+	if (callback == NULL && user_data == NULL) {
+		data->update_callback_mode = false;
+		data->update_callback = NULL;
+		data->update_user_data = NULL;
 
-	/* Clear alarm enable bit */
-	if (alarm_id == ALARM0_ID) {
-		data->registers.rtc_control.alm0_en = 0;
-	} else if (alarm_id == ALARM1_ID) {
-		data->registers.rtc_control.alm1_en = 0;
-	} else {
-		rc = -EINVAL;
-		goto out;
+
+		//TODO: reconfigure IC
+		k_sem_give(&data->lock);
+		return 0;
 	}
-
-	rc = write_register(dev, REG_RTC_CONTROL,
-		*((uint8_t *)(&data->registers.rtc_control)));
-
-out:
+	//TODO
 	k_sem_give(&data->lock);
+	return -ENOSYS;
+}
+#endif /* CONFIG_RTC_UPDATE */
 
-	return rc;
+#if defined(CONFIG_RTC_CALIBRATION)	
+static int mcp79412_set_calibration(const struct device * dev, int32_t calibration) {
+	return -ENOSYS;
 }
 
-/* This function can be used to poll the alarm interrupt flags if the MCU is
- * not connected to the MC79412 MFP pin. It can also be used to check if an
- * alarm was triggered while the MCU was in reset. This function will clear
- * the interrupt flag
- *
- * Return bitmask of alarm interrupt flag (IF) where each IF is shifted by
- * the alarm ID.
- */
-/*
-static uint32_t mcp79412_counter_get_pending_int(const struct device *dev)
-{
-	struct mcp79412_data *data = dev->data;
-	uint32_t interrupt_pending = 0;
-	int rc;
-
-	k_sem_take(&data->lock, K_FOREVER);
-
-	// Check interrupt flag for alarm 0
-	rc = read_register(dev, REG_ALM0_WDAY,
-		(uint8_t *)&data->alm0_registers.alm_weekday);
-	if (rc < 0) {
-		goto out;
-	}
-
-	if (data->alm0_registers.alm_weekday.alm_if) {
-		// Clear interrupt
-		data->alm0_registers.alm_weekday.alm_if = 0;
-		rc = write_register(dev, REG_ALM0_WDAY,
-			*((uint8_t *)(&data->alm0_registers.alm_weekday)));
-		if (rc < 0) {
-			goto out;
-		}
-		interrupt_pending |= (1 << ALARM0_ID);
-	}
-
-	// Check interrupt flag for alarm 1
-	rc = read_register(dev, REG_ALM1_WDAY,
-		(uint8_t *)&data->alm1_registers.alm_weekday);
-	if (rc < 0) {
-		goto out;
-	}
-
-	if (data->alm1_registers.alm_weekday.alm_if) {
-		// Clear interrupt
-		data->alm1_registers.alm_weekday.alm_if = 0;
-		rc = write_register(dev, REG_ALM1_WDAY,
-			*((uint8_t *)(&data->alm1_registers.alm_weekday)));
-		if (rc < 0) {
-			goto out;
-		}
-		interrupt_pending |= (1 << ALARM1_ID);
-	}
-
-out:
-	k_sem_give(&data->lock);
-
-	if (rc) {
-		interrupt_pending = 0;
-	}
-	return (interrupt_pending);
+static int mcp79412_get_calibration(const struct device * dev, int32_t calibration) {
+	return -ENOSYS;
 }
-*/
+#endif /* CONFIG_RTC_CALIBRATION */
 
 static int mcp79412_init(const struct device *dev)
 {
@@ -607,28 +632,23 @@ static int mcp79412_init(const struct device *dev)
 
 	/* Set day of week and update VBat enable config */
 	rc = set_day_of_week(dev, rtc_time_to_tm(&time));
-	if (rc < 0) {
-		goto out;
-	}
+	if (rc < 0) goto out;
 
 	/* Set 24-hour time */
 	data->registers.rtc_hours.twelve_hr = false;
 	rc = write_register(dev, REG_RTC_HOUR,
 		*((uint8_t *)(&data->registers.rtc_hours)));
-	if (rc < 0) {
-		goto out;
-	}
+	if (rc < 0) goto out;
 
 	/* Configure alarm interrupt gpio */
 	if (cfg->int_gpios.port != NULL) {
-		/*
 		if (!gpio_is_ready_dt(&cfg->int_gpios)) {
 			LOG_ERR("Port device %s is not ready",
 				cfg->int_gpios.port->name);
 			rc = -ENODEV;
 			goto out;
 		}
-
+		
 		data->mcp79412 = dev;
 		k_work_init(&data->alarm_work, mcp79412_work_handler);
 
@@ -636,7 +656,7 @@ static int mcp79412_init(const struct device *dev)
 
 		gpio_pin_interrupt_configure_dt(&cfg->int_gpios,
 						GPIO_INT_EDGE_TO_ACTIVE);
-
+		
 		gpio_init_callback(&data->int_callback, mcp79412_init_cb,
 				   BIT(cfg->int_gpios.pin));
 
@@ -654,7 +674,6 @@ static int mcp79412_init(const struct device *dev)
 				    *((uint8_t *)(&data->alm0_registers.alm_weekday)));
 		rc = write_register(dev, REG_ALM1_WDAY,
 				    *((uint8_t *)(&data->alm1_registers.alm_weekday)));
-		*/
 	}
 	if (data->registers.rtc_sec.start_osc == 0) {
 		data->registers.rtc_sec.start_osc = 1;
@@ -671,17 +690,17 @@ static DEVICE_API(rtc, mcp79412_api) = {
 	.get_time = read_time,
 #if defined(CONFIG_RTC_ALARM)
 	.alarm_get_supported_fields = mcp79412_alarm_supported,
-	.alarm_set_time = mcp79412_alarm_set_time,	// done untill here
-	.alarm_get_time = rtc_counter_alarm_get_time,
-	.alarm_is_pending = rtc_counter_alarm_is_pending,
-	.alarm_set_callback = rtc_counter_alarm_set_callback,
+	.alarm_set_time = mcp79412_alarm_set_time,	
+	.alarm_get_time = mcp79412_alarm_get_time,
+	.alarm_is_pending = mcp79412_alarm_is_pending,		//TODO: Remake to poll for interrupts
+	.alarm_set_callback = mcp79412_alarm_set_callback,
 #endif /* CONFIG_RTC_ALARM */
 #if defined(CONFIG_RTC_UPDATE)
-	.update_set_callback = rtc_counter_update_set_callback,
+	.update_set_callback = mcp79412_update_set_callback, //TODO
 #endif /* CONFIG_RTC_UPDATE */
-#if defined(CONFIG_RTC_CALIBRATION)
-	.set_calibration = rtc_counter_set_calibration,
-	.get_calibration = rtc_counter_get_calibration,
+#if defined(CONFIG_RTC_CALIBRATION)					
+	.set_calibration = mcp79412_set_calibration,	// not implemented
+	.get_calibration = mcp79412_get_calibration,	// not implemented
 #endif /* CONFIG_RTC_CALIBRATION */
 };
 
@@ -690,12 +709,6 @@ static DEVICE_API(rtc, mcp79412_api) = {
 	static struct mcp79412_data mcp79412_data_##index;				\
 											\
 	static const struct mcp79412_config mcp79412_config_##index = {			\
-		.generic = {								\
-			.max_top_value = UINT32_MAX,					\
-			.freq = 1,							\
-			.flags = COUNTER_CONFIG_INFO_COUNT_UP,				\
-			.channels = 2,							\
-		},									\
 		.i2c = I2C_DT_SPEC_INST_GET(index),					\
 		.int_gpios = GPIO_DT_SPEC_INST_GET_OR(index, int_gpios, {0}),		\
 		.vbat_enable = DT_INST_PROP(index, vbat_enable)				\
