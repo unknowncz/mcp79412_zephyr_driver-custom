@@ -398,6 +398,12 @@ static void mcp79412_handle_interrupt(const struct device *dev, uint16_t alarm_i
 	}
 }
 
+static void mcp79412_handle_change(const struct device *dev) {
+	struct mcp79412_data *data = dev->data;
+	if (data->update_callback == NULL) return;
+	data->update_callback(dev, data->update_user_data);
+}
+
 static void mcp79412_work_handler(struct k_work *work)
 {
 	struct mcp79412_data *data =
@@ -406,6 +412,8 @@ static void mcp79412_work_handler(struct k_work *work)
 	/* Check interrupt flags for both alarms */
 	mcp79412_handle_interrupt(data->mcp79412, ALARM0_ID);
 	mcp79412_handle_interrupt(data->mcp79412, ALARM1_ID);
+
+	mcp79412_handle_change(data->mcp79412);
 }
 
 static void mcp79412_init_cb(const struct device *dev,
@@ -581,18 +589,22 @@ static int mcp79412_update_set_callback(const struct device * dev,
 	struct mcp79412_data *data = dev->data;
 	k_sem_take(&data->lock, K_FOREVER);
 	if (callback == NULL && user_data == NULL) {
-		data->update_callback_mode = false;
 		data->update_callback = NULL;
 		data->update_user_data = NULL;
-
-
-		//TODO: reconfigure IC
+		data->registers.rtc_control.sqw_en = 0;
+		int rc = write_register(dev, REG_RTC_CONTROL,
+		*((uint8_t *)(&data->registers.rtc_control)));
 		k_sem_give(&data->lock);
-		return 0;
+		return rc;
 	}
-	//TODO
+	if (callback == NULL) return -EINVAL;
+	data->update_callback = callback;
+	data->update_user_data = user_data;
+	data->registers.rtc_control.sqw_en = 1;
+	int rc = write_register(dev, REG_RTC_CONTROL,
+	*((uint8_t *)(&data->registers.rtc_control)));
 	k_sem_give(&data->lock);
-	return -ENOSYS;
+	return rc;
 }
 #endif /* CONFIG_RTC_UPDATE */
 

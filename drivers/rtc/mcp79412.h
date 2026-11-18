@@ -261,7 +261,6 @@ struct mcp79412_data {
 	uint16_t alarm_mask[2];
 	void *alarm_user_data[2];
 
-	bool update_callback_mode;
 	rtc_update_callback update_callback;
 	void *update_user_data;
 
