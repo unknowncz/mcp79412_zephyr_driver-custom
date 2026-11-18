@@ -50,7 +50,7 @@ LOG_MODULE_REGISTER(MCP79412, CONFIG_RTC_LOG_LEVEL);
 
 struct mcp79412_config {
 	struct i2c_dt_spec i2c;
-	const struct gpio_dt_spec int_gpios;
+	const struct gpio_dt_spec irq_gpios;
 	bool vbat_enable;
 };
 
@@ -641,10 +641,10 @@ static int mcp79412_init(const struct device *dev)
 	if (rc < 0) goto out;
 
 	/* Configure alarm interrupt gpio */
-	if (cfg->int_gpios.port != NULL) {
-		if (!gpio_is_ready_dt(&cfg->int_gpios)) {
+	if (cfg->irq_gpios.port != NULL) {
+		if (!gpio_is_ready_dt(&cfg->irq_gpios)) {
 			LOG_ERR("Port device %s is not ready",
-				cfg->int_gpios.port->name);
+				cfg->irq_gpios.port->name);
 			rc = -ENODEV;
 			goto out;
 		}
@@ -652,18 +652,18 @@ static int mcp79412_init(const struct device *dev)
 		data->mcp79412 = dev;
 		k_work_init(&data->alarm_work, mcp79412_work_handler);
 
-		gpio_pin_configure_dt(&cfg->int_gpios, GPIO_INPUT);
+		gpio_pin_configure_dt(&cfg->irq_gpios, GPIO_INPUT);
 
-		gpio_pin_interrupt_configure_dt(&cfg->int_gpios,
+		gpio_pin_interrupt_configure_dt(&cfg->irq_gpios,
 						GPIO_INT_EDGE_TO_ACTIVE);
 		
 		gpio_init_callback(&data->int_callback, mcp79412_init_cb,
-				   BIT(cfg->int_gpios.pin));
+				   BIT(cfg->irq_gpios.pin));
 
-		(void)gpio_add_callback(cfg->int_gpios.port, &data->int_callback);
+		(void)gpio_add_callback(cfg->irq_gpios.port, &data->int_callback);
 
 		// Configure interrupt polarity
-		if ((cfg->int_gpios.dt_flags & GPIO_ACTIVE_LOW) == GPIO_ACTIVE_LOW) {
+		if ((cfg->irq_gpios.dt_flags & GPIO_ACTIVE_LOW) == GPIO_ACTIVE_LOW) {
 			data->int_active_high = false;
 		} else {
 			data->int_active_high = true;
@@ -710,7 +710,7 @@ static DEVICE_API(rtc, mcp79412_api) = {
 											\
 	static const struct mcp79412_config mcp79412_config_##index = {			\
 		.i2c = I2C_DT_SPEC_INST_GET(index),					\
-		.int_gpios = GPIO_DT_SPEC_INST_GET_OR(index, int_gpios, {0}),		\
+		.irq_gpios = GPIO_DT_SPEC_INST_GET_OR(index, irq_gpios, {0}),		\
 		.vbat_enable = DT_INST_PROP(index, vbat_enable)				\
 	};										\
 											\

@@ -10,7 +10,7 @@ properties:
     type: boolean
     required: false
     description: Enable Vbat.
-  int-gpios:
+  irq-gpios:
     type: phandle-array
     description: |
       The INT1 signal connection.
